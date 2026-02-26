@@ -11,9 +11,9 @@ Usage:
 """
 
 import json
+import re
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 from pathlib import Path
 import sys
 
@@ -36,66 +36,40 @@ plt.rcParams.update({
 
 def extract_tag_id(json_path):
     """Extract tag ID from filename pattern: {TAG_ID}_{YYYY-MM-DD}_{HH-MM-SS}.json"""
-    import re
     stem = json_path.stem
-    # Find the date pattern and take everything before it as the tag ID
     match = re.search(r'_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})$', stem)
     if match:
         return stem[:match.start()]
     return stem
 
 
-def classify_outcome(position):
-    """Classify position outcome into three tiers."""
-    sr = position.get('server_response', {})
-    failed_checks = sr.get('failed_checks', [])
-
-    if 'missing_uid' in failed_checks:
-        return 'unreadable'
-    elif sr.get('status') == 'Not Registered':
-        return 'readable'
-    else:
-        return 'server_error'
-
-
 def build_data_arrays(positions):
-    """Build numpy arrays from positions list."""
-    n = len(positions)
+    """Build numpy arrays from positions list (speckle entries only)."""
+    # Filter to positions that have speckle data
+    speckle_positions = [p for p in positions if 'speckle_area_percent' in p]
+    n = len(speckle_positions)
+
     heights = np.zeros(n, dtype=int)
     yaws = np.zeros(n, dtype=float)
     pitches = np.zeros(n, dtype=float)
     rolls = np.zeros(n, dtype=float)
-    is_readable = np.zeros(n, dtype=bool)
-    speckle_area = np.full(n, np.nan)
-    processing_time = np.zeros(n, dtype=float)
-    capture_time = np.zeros(n, dtype=float)
-    outcomes = []
+    speckle_area = np.zeros(n, dtype=float)
 
-    for i, pos in enumerate(positions):
+    for i, pos in enumerate(speckle_positions):
         heights[i] = pos['height_mm']
         yaws[i] = pos['yaw_degrees']
         pitches[i] = pos['pitch_degrees']
         rolls[i] = pos['roll_degrees']
-        capture_time[i] = pos.get('capture_time_seconds', 0)
-        processing_time[i] = pos.get('server_response', {}).get('processing_time_ms', 0)
-
-        outcome = classify_outcome(pos)
-        outcomes.append(outcome)
-        is_readable[i] = (outcome == 'readable')
-
-        if 'speckle_area_percent' in pos:
-            speckle_area[i] = pos['speckle_area_percent']
+        speckle_area[i] = pos['speckle_area_percent']
 
     return {
         'heights': heights,
         'yaws': yaws,
         'pitches': pitches,
         'rolls': rolls,
-        'is_readable': is_readable,
-        'outcomes': np.array(outcomes),
         'speckle_area': speckle_area,
-        'processing_time': processing_time,
-        'capture_time': capture_time,
+        'total_positions': len(positions),
+        'speckle_positions': n,
     }
 
 
@@ -136,31 +110,17 @@ def load_sweep(json_path):
 # METRIC COMPUTATION
 # ============================================================
 
-def compute_readability_rate(data, param_name, param_values):
-    """Compute readability rate grouped by a parameter."""
-    params = data[param_name]
-    rates = []
-    for val in param_values:
-        mask = np.isclose(params, val)
-        valid = data['outcomes'][mask] != 'server_error'
-        readable = data['is_readable'][mask] & valid
-        rate = np.sum(readable) / np.sum(valid) * 100 if np.sum(valid) > 0 else 0
-        rates.append(rate)
-    return np.array(rates)
-
-
 def compute_speckle_by_param(data, param_name, param_values):
-    """Compute mean speckle grouped by a parameter (readable entries only)."""
+    """Compute mean speckle grouped by a parameter."""
     params = data[param_name]
     means = []
     stds = []
     for val in param_values:
-        mask = np.isclose(params, val) & data['is_readable']
+        mask = np.isclose(params, val)
         speckles = data['speckle_area'][mask]
-        valid = speckles[~np.isnan(speckles)]
-        if len(valid) > 0:
-            means.append(np.mean(valid))
-            stds.append(np.std(valid))
+        if len(speckles) > 0:
+            means.append(np.mean(speckles))
+            stds.append(np.std(speckles))
         else:
             means.append(np.nan)
             stds.append(np.nan)
@@ -168,8 +128,8 @@ def compute_speckle_by_param(data, param_name, param_values):
 
 
 def compute_2d_grid(data, row_param, row_values, col_param, col_values,
-                    fixed_params=None, metric='readability'):
-    """Compute a 2D grid of a metric for heatmap display."""
+                    fixed_params=None, metric='speckle_mean'):
+    """Compute a 2D grid of speckle metric for heatmap display."""
     grid = np.full((len(row_values), len(col_values)), np.nan)
     rows = data[row_param]
     cols = data[col_param]
@@ -182,116 +142,42 @@ def compute_2d_grid(data, row_param, row_values, col_param, col_values,
                 for fp_name, fp_val in fixed_params.items():
                     mask &= np.isclose(data[fp_name], fp_val)
 
-            if metric == 'readability':
-                valid = data['outcomes'][mask] != 'server_error'
-                readable = data['is_readable'][mask] & valid
-                grid[i, j] = np.sum(readable) / np.sum(valid) * 100 if np.sum(valid) > 0 else np.nan
-            elif metric == 'speckle_mean':
-                readable_mask = mask & data['is_readable']
-                speckles = data['speckle_area'][readable_mask]
-                valid = speckles[~np.isnan(speckles)]
-                grid[i, j] = np.mean(valid) if len(valid) > 0 else np.nan
-            elif metric == 'speckle_max':
-                readable_mask = mask & data['is_readable']
-                speckles = data['speckle_area'][readable_mask]
-                valid = speckles[~np.isnan(speckles)]
-                grid[i, j] = np.max(valid) if len(valid) > 0 else np.nan
+            speckles = data['speckle_area'][mask]
+            if len(speckles) > 0:
+                if metric == 'speckle_mean':
+                    grid[i, j] = np.mean(speckles)
+                elif metric == 'speckle_max':
+                    grid[i, j] = np.max(speckles)
 
     return grid
 
 
 # ============================================================
-# PLOT 1: READABILITY HEATMAP GRID
-# ============================================================
-
-def plot_readability_heatmap_grid(data, axis_values, tag_id):
-    """4x4 grid of pitch vs roll heatmaps, faceted by height x yaw."""
-    height_vals = axis_values['height']
-    yaw_vals = axis_values['yaw']
-    pitch_vals = axis_values['pitch']
-    roll_vals = axis_values['roll']
-
-    fig, axes = plt.subplots(len(height_vals), len(yaw_vals),
-                              figsize=(14, 14), squeeze=False)
-    fig.suptitle(f'QR Readability Across Parameter Space\nTag: {tag_id}',
-                 fontsize=16, fontweight='bold', y=0.98)
-
-    cmap = ListedColormap(['#d32f2f', '#66bb6a'])
-    norm = BoundaryNorm([0, 50, 100], cmap.N)
-
-    for i, h in enumerate(height_vals):
-        for j, y in enumerate(yaw_vals):
-            ax = axes[i, j]
-            grid = compute_2d_grid(data, 'pitches', pitch_vals, 'rolls', roll_vals,
-                                   fixed_params={'heights': h, 'yaws': y},
-                                   metric='readability')
-
-            im = ax.imshow(grid, cmap=cmap, norm=norm, aspect='equal',
-                          origin='lower', interpolation='nearest')
-
-            ax.set_xticks(range(len(roll_vals)))
-            ax.set_xticklabels([f'{int(v)}' for v in roll_vals], fontsize=7)
-            ax.set_yticks(range(len(pitch_vals)))
-            ax.set_yticklabels([f'{int(v)}' for v in pitch_vals], fontsize=7)
-
-            if i == len(height_vals) - 1:
-                ax.set_xlabel('Roll (deg)', fontsize=8)
-            if j == 0:
-                ax.set_ylabel('Pitch (deg)', fontsize=8)
-
-            ax.set_title(f'H={h}mm, Yaw={y}\u00b0', fontsize=9, pad=4)
-
-            # Annotate cells
-            for ri in range(len(pitch_vals)):
-                for ci in range(len(roll_vals)):
-                    val = grid[ri, ci]
-                    if not np.isnan(val):
-                        label = 'R' if val > 50 else 'U'
-                        color = 'white' if val < 50 else 'black'
-                        ax.text(ci, ri, label, ha='center', va='center',
-                               fontsize=6, fontweight='bold', color=color)
-
-    # Legend
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='#66bb6a', label='Readable'),
-                       Patch(facecolor='#d32f2f', label='Unreadable')]
-    fig.legend(handles=legend_elements, loc='lower center', ncol=2,
-               fontsize=11, frameon=True, bbox_to_anchor=(0.5, 0.01))
-
-    plt.tight_layout(rect=[0, 0.04, 1, 0.95])
-    save_path = OUTPUT_DIR / f'{tag_id}_readability_grid.png'
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    print(f"  Saved: {save_path.name}")
-
-
-# ============================================================
-# PLOT 2: SPECKLE AREA HEATMAP GRID
+# PLOT 1: SPECKLE AREA HEATMAP GRID
 # ============================================================
 
 def plot_speckle_heatmap_grid(data, axis_values, tag_id):
-    """Speckle area heatmaps for readable heights only."""
-    readable_heights = [h for h in axis_values['height']
-                        if np.any(data['is_readable'] & np.isclose(data['heights'], h))]
+    """Speckle area heatmaps faceted by height x yaw."""
+    height_vals = axis_values['height']
+    # Only show heights that have speckle data
+    height_vals = np.array([h for h in height_vals
+                            if np.any(np.isclose(data['heights'], h))])
     yaw_vals = axis_values['yaw']
     pitch_vals = axis_values['pitch']
     roll_vals = axis_values['roll']
 
-    if not readable_heights:
-        print("  Skipped speckle grid: no readable entries")
+    if len(height_vals) == 0:
+        print("  Skipped speckle grid: no speckle data")
         return
 
-    fig, axes = plt.subplots(len(readable_heights), len(yaw_vals),
-                              figsize=(14, 4 * len(readable_heights)), squeeze=False)
-    fig.suptitle(f'Speckle Area (%) - Readable Positions Only\nTag: {tag_id}',
+    fig, axes = plt.subplots(len(height_vals), len(yaw_vals),
+                              figsize=(14, 4 * len(height_vals)), squeeze=False)
+    fig.suptitle(f'Speckle Area (%)\nTag: {tag_id}',
                  fontsize=16, fontweight='bold', y=0.98)
 
-    # Find global max for consistent colorscale
-    readable_speckle = data['speckle_area'][data['is_readable']]
-    valid_speckle = readable_speckle[~np.isnan(readable_speckle)]
-    vmax = np.max(valid_speckle) if len(valid_speckle) > 0 else 0.1
+    vmax = np.max(data['speckle_area']) if len(data['speckle_area']) > 0 else 0.1
 
-    for i, h in enumerate(readable_heights):
+    for i, h in enumerate(height_vals):
         for j, y in enumerate(yaw_vals):
             ax = axes[i, j]
             grid = compute_2d_grid(data, 'pitches', pitch_vals, 'rolls', roll_vals,
@@ -307,7 +193,7 @@ def plot_speckle_heatmap_grid(data, axis_values, tag_id):
             ax.set_yticks(range(len(pitch_vals)))
             ax.set_yticklabels([f'{int(v)}' for v in pitch_vals], fontsize=7)
 
-            if i == len(readable_heights) - 1:
+            if i == len(height_vals) - 1:
                 ax.set_xlabel('Roll (deg)', fontsize=8)
             if j == 0:
                 ax.set_ylabel('Pitch (deg)', fontsize=8)
@@ -336,11 +222,11 @@ def plot_speckle_heatmap_grid(data, axis_values, tag_id):
 
 
 # ============================================================
-# PLOT 3: MARGINAL EFFECTS
+# PLOT 2: MARGINAL EFFECTS (SPECKLE ONLY)
 # ============================================================
 
 def plot_marginal_effects(data, axis_values, tag_id):
-    """Marginal effect of each parameter on readability and speckle."""
+    """Mean speckle as a function of each parameter independently."""
     param_map = {
         'Height (mm)': ('heights', axis_values['height']),
         'Yaw (deg)': ('yaws', axis_values['yaw']),
@@ -349,50 +235,35 @@ def plot_marginal_effects(data, axis_values, tag_id):
     }
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f'Marginal Parameter Effects\nTag: {tag_id}',
+    fig.suptitle(f'Mean Speckle Area by Parameter\nTag: {tag_id}',
                  fontsize=16, fontweight='bold')
 
+    color = '#d32f2f'
+
     for ax, (label, (param_name, param_vals)) in zip(axes.flat, param_map.items()):
-        # Readability rate
-        rates = compute_readability_rate(data, param_name, param_vals)
-        x = np.arange(len(param_vals))
+        # Only show params that have data
+        has_data = [np.any(np.isclose(data[param_name], v)) for v in param_vals]
+        param_vals_filtered = param_vals[has_data]
 
-        color_read = '#1976d2'
-        color_speckle = '#d32f2f'
+        means, stds = compute_speckle_by_param(data, param_name, param_vals_filtered)
+        x = np.arange(len(param_vals_filtered))
+        valid = ~np.isnan(means)
 
-        ax.bar(x - 0.15, rates, 0.3, color=color_read, alpha=0.7, label='Readability (%)')
-        ax.set_ylabel('Readability (%)', color=color_read, fontsize=10)
-        ax.set_ylim(0, 110)
-        ax.tick_params(axis='y', labelcolor=color_read)
-
-        # Speckle on secondary axis
-        ax2 = ax.twinx()
-        means, stds = compute_speckle_by_param(data, param_name, param_vals)
-        valid_mask = ~np.isnan(means)
-        if np.any(valid_mask):
-            ax2.errorbar(x[valid_mask], means[valid_mask], yerr=stds[valid_mask],
-                        color=color_speckle, marker='o', linewidth=2,
-                        markersize=6, capsize=3, label='Mean Speckle (%)')
-            ax2.set_ylabel('Speckle Area (%)', color=color_speckle, fontsize=10)
-            ax2.tick_params(axis='y', labelcolor=color_speckle)
-            ax2.set_ylim(bottom=0)
+        if np.any(valid):
+            ax.bar(x[valid], means[valid], 0.6, color=color, alpha=0.7, edgecolor='black',
+                   linewidth=0.5)
+            ax.errorbar(x[valid], means[valid], yerr=stds[valid],
+                       fmt='none', color='black', capsize=4, linewidth=1.5)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([f'{v:.0f}' if v == int(v) else f'{v}' for v in param_vals])
+        ax.set_xticklabels([f'{v:.0f}' if v == int(v) else f'{v}' for v in param_vals_filtered])
         ax.set_xlabel(label, fontsize=11)
+        ax.set_ylabel('Mean Speckle Area (%)', fontsize=10)
         ax.set_title(label, fontsize=12, fontweight='bold')
+        ax.set_ylim(bottom=0)
+        ax.grid(True, axis='y', alpha=0.3)
 
-    # Combined legend
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor=color_read, alpha=0.7, label='Readability (%)'),
-        Line2D([0], [0], color=color_speckle, marker='o', linewidth=2, label='Mean Speckle (%)'),
-    ]
-    fig.legend(handles=legend_elements, loc='lower center', ncol=2,
-               fontsize=11, frameon=True, bbox_to_anchor=(0.5, 0.01))
-
-    plt.tight_layout(rect=[0, 0.05, 1, 0.93])
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
     save_path = OUTPUT_DIR / f'{tag_id}_marginal_effects.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
@@ -400,7 +271,7 @@ def plot_marginal_effects(data, axis_values, tag_id):
 
 
 # ============================================================
-# PLOT 4: ANGULAR SENSITIVITY
+# PLOT 3: ANGULAR SENSITIVITY
 # ============================================================
 
 def plot_angular_sensitivity(data, axis_values, tag_id):
@@ -408,52 +279,52 @@ def plot_angular_sensitivity(data, axis_values, tag_id):
     pitch_vals = axis_values['pitch']
     roll_vals = axis_values['roll']
 
+    # Heights with speckle data
+    height_vals = np.array([h for h in axis_values['height']
+                            if np.any(np.isclose(data['heights'], h))])
+
+    if len(height_vals) == 0:
+        print("  Skipped angular sensitivity: no speckle data")
+        return
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     fig.suptitle(f'Angular Sensitivity Analysis\nTag: {tag_id}',
                  fontsize=16, fontweight='bold')
 
-    # Left: Pitch-roll plane contour (averaged over yaw, at most speckled height)
-    readable_heights = [h for h in axis_values['height']
-                        if np.any(data['is_readable'] & np.isclose(data['heights'], h))]
+    # Left: Pitch-roll plane contour at height with most speckle
+    best_h = None
+    best_mean = 0
+    for h in height_vals:
+        mask = np.isclose(data['heights'], h)
+        sp = data['speckle_area'][mask]
+        if len(sp) > 0 and np.mean(sp) > best_mean:
+            best_mean = np.mean(sp)
+            best_h = h
 
-    if readable_heights:
-        # Use the height with most speckle for contour
-        best_h = None
-        best_mean = 0
-        for h in readable_heights:
-            mask = data['is_readable'] & np.isclose(data['heights'], h)
-            sp = data['speckle_area'][mask]
-            sp = sp[~np.isnan(sp)]
-            if len(sp) > 0 and np.mean(sp) > best_mean:
-                best_mean = np.mean(sp)
-                best_h = h
+    if best_h is not None:
+        grid = compute_2d_grid(data, 'pitches', pitch_vals, 'rolls', roll_vals,
+                               fixed_params={'heights': best_h},
+                               metric='speckle_mean')
 
-        if best_h is not None:
-            # Average over yaw for this height
-            grid = compute_2d_grid(data, 'pitches', pitch_vals, 'rolls', roll_vals,
-                                   fixed_params={'heights': best_h},
-                                   metric='speckle_mean')
+        P, R = np.meshgrid(roll_vals, pitch_vals)
+        contour = ax1.contourf(P, R, grid, levels=15, cmap='YlOrRd')
+        ax1.contour(P, R, grid, levels=15, colors='gray', linewidths=0.3, alpha=0.5)
+        plt.colorbar(contour, ax=ax1, label='Speckle Area (%)')
+        ax1.set_xlabel('Roll (deg)', fontsize=11)
+        ax1.set_ylabel('Pitch (deg)', fontsize=11)
+        ax1.set_title(f'Speckle at H={best_h}mm\n(averaged over yaw)', fontsize=12)
+        ax1.set_aspect('equal')
+        ax1.axhline(0, color='gray', linewidth=0.5, linestyle='--')
+        ax1.axvline(0, color='gray', linewidth=0.5, linestyle='--')
 
-            P, R = np.meshgrid(roll_vals, pitch_vals)
-            contour = ax1.contourf(P, R, grid, levels=15, cmap='YlOrRd')
-            ax1.contour(P, R, grid, levels=15, colors='gray', linewidths=0.3, alpha=0.5)
-            plt.colorbar(contour, ax=ax1, label='Speckle Area (%)')
-            ax1.set_xlabel('Roll (deg)', fontsize=11)
-            ax1.set_ylabel('Pitch (deg)', fontsize=11)
-            ax1.set_title(f'Speckle at H={best_h}mm\n(averaged over yaw)', fontsize=12)
-            ax1.set_aspect('equal')
-            ax1.axhline(0, color='gray', linewidth=0.5, linestyle='--')
-            ax1.axvline(0, color='gray', linewidth=0.5, linestyle='--')
-
-    # Right: Mean speckle vs angular deviation, per readable height
-    colors = plt.cm.tab10(np.linspace(0, 1, len(readable_heights)))
-    for h, color in zip(readable_heights, colors):
-        mask = data['is_readable'] & np.isclose(data['heights'], h)
+    # Right: Mean speckle vs angular deviation, per height
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(height_vals), 1)))
+    for h, clr in zip(height_vals, colors):
+        mask = np.isclose(data['heights'], h)
         p = data['pitches'][mask]
         r = data['rolls'][mask]
         sp = data['speckle_area'][mask]
 
-        # Compute angular distance from normal
         ang_dist = np.sqrt(p**2 + r**2)
         unique_dists = np.sort(np.unique(np.round(ang_dist, 1)))
 
@@ -461,10 +332,9 @@ def plot_angular_sensitivity(data, axis_values, tag_id):
         for d in unique_dists:
             d_mask = np.isclose(np.round(ang_dist, 1), d)
             vals = sp[d_mask]
-            vals = vals[~np.isnan(vals)]
             mean_speckles.append(np.mean(vals) if len(vals) > 0 else np.nan)
 
-        ax2.plot(unique_dists, mean_speckles, 'o-', color=color,
+        ax2.plot(unique_dists, mean_speckles, 'o-', color=clr,
                 label=f'H={h}mm', linewidth=2, markersize=5)
 
     ax2.set_xlabel('Angular Deviation from Normal (deg)', fontsize=11)
@@ -482,58 +352,33 @@ def plot_angular_sensitivity(data, axis_values, tag_id):
 
 
 # ============================================================
-# PLOT 5: SUMMARY STATISTICS
+# PLOT 4: SUMMARY STATISTICS
 # ============================================================
 
 def plot_summary_statistics(data, axis_values, sweep_config, sweep_results, tag_id):
-    """Text-based summary figure."""
-    fig, ax = plt.subplots(figsize=(10, 12))
+    """Text-based summary figure focused on speckle."""
+    fig, ax = plt.subplots(figsize=(10, 10))
     ax.axis('off')
 
-    # Compute stats
-    total = len(data['outcomes'])
-    n_readable = np.sum(data['is_readable'])
-    n_unreadable = np.sum(data['outcomes'] == 'unreadable')
-    n_error = np.sum(data['outcomes'] == 'server_error')
+    sp = data['speckle_area']
+    n_speckle = data['speckle_positions']
+    n_total = data['total_positions']
 
-    readable_speckle = data['speckle_area'][data['is_readable']]
-    valid_speckle = readable_speckle[~np.isnan(readable_speckle)]
-
-    # Per-height readability
+    # Per-height speckle stats
     height_lines = []
     for h in axis_values['height']:
         mask = np.isclose(data['heights'], h)
-        valid = data['outcomes'][mask] != 'server_error'
-        n_read = np.sum(data['is_readable'][mask])
-        n_total = np.sum(valid)
-        rate = n_read / n_total * 100 if n_total > 0 else 0
-        height_lines.append(f"    {h}mm: {n_read}/{n_total} ({rate:.0f}%)")
+        h_sp = sp[mask]
+        if len(h_sp) > 0:
+            height_lines.append(
+                f"    {h}mm: mean={np.mean(h_sp):.4f}%, max={np.max(h_sp):.4f}%, "
+                f"non-zero={np.sum(h_sp > 0)}/{len(h_sp)}"
+            )
 
     # Best/worst angular positions
-    if len(valid_speckle) > 0:
-        readable_mask = data['is_readable'] & ~np.isnan(data['speckle_area'])
-        sp = data['speckle_area'][readable_mask]
-        pitches = data['pitches'][readable_mask]
-        rolls = data['rolls'][readable_mask]
-        heights = data['heights'][readable_mask]
-
-        worst_idx = np.argmax(sp)
-        best_idx = np.argmin(sp)
-
-        speckle_text = (
-            f"  Mean:       {np.mean(valid_speckle):.4f}%\n"
-            f"  Std:        {np.std(valid_speckle):.4f}%\n"
-            f"  Median:     {np.median(valid_speckle):.4f}%\n"
-            f"  Max:        {np.max(valid_speckle):.4f}%\n"
-            f"  Non-zero:   {np.sum(valid_speckle > 0)}/{len(valid_speckle)}\n"
-            f"\n"
-            f"  Worst: {sp[worst_idx]:.4f}% at H={heights[worst_idx]:.0f}mm, "
-            f"P={pitches[worst_idx]:.0f}, R={rolls[worst_idx]:.0f}\n"
-            f"  Best:  {sp[best_idx]:.4f}% at H={heights[best_idx]:.0f}mm, "
-            f"P={pitches[best_idx]:.0f}, R={rolls[best_idx]:.0f}"
-        )
-    else:
-        speckle_text = "  No speckle data available"
+    worst_idx = np.argmax(sp)
+    best_nonzero = sp[sp > 0]
+    best_idx = np.argmin(sp) if np.min(sp) > 0 else None
 
     duration = sweep_results.get('duration_seconds', 0)
     duration_min = duration / 60
@@ -541,21 +386,22 @@ def plot_summary_statistics(data, axis_values, sweep_config, sweep_results, tag_
     text = (
         f"SPECKLE ANALYSIS SUMMARY\n"
         f"{'='*50}\n\n"
-        f"Tag ID:        {tag_id}\n"
-        f"Sweep Duration: {duration_min:.1f} minutes\n"
-        f"Total Positions: {total}\n\n"
-        f"READABILITY\n"
+        f"Tag ID:          {tag_id}\n"
+        f"Sweep Duration:  {duration_min:.1f} minutes\n"
+        f"Total Positions: {n_total}\n"
+        f"With Speckle:    {n_speckle}\n\n"
+        f"SPECKLE AREA\n"
         f"{'-'*50}\n"
-        f"  Readable:     {n_readable}/{total} ({n_readable/total*100:.1f}%)\n"
-        f"  Unreadable:   {n_unreadable}/{total} ({n_unreadable/total*100:.1f}%)\n"
-        f"  Server Error: {n_error}\n\n"
+        f"  Mean:       {np.mean(sp):.4f}%\n"
+        f"  Std:        {np.std(sp):.4f}%\n"
+        f"  Median:     {np.median(sp):.4f}%\n"
+        f"  Max:        {np.max(sp):.4f}%\n"
+        f"  Non-zero:   {np.sum(sp > 0)}/{len(sp)}\n\n"
         f"  Per Height:\n"
         + '\n'.join(height_lines) +
         f"\n\n"
-        f"SPECKLE AREA (readable positions)\n"
-        f"{'-'*50}\n"
-        + speckle_text +
-        f"\n\n"
+        f"  Worst: {sp[worst_idx]:.4f}% at H={data['heights'][worst_idx]}mm, "
+        f"P={data['pitches'][worst_idx]:.0f}, R={data['rolls'][worst_idx]:.0f}\n\n"
         f"SWEEP CONFIGURATION\n"
         f"{'-'*50}\n"
         f"  Heights:  {list(axis_values['height'])} mm\n"
@@ -582,104 +428,52 @@ def plot_summary_statistics(data, axis_values, sweep_config, sweep_results, tag_
 
 
 # ============================================================
-# PLOT 6: TIMING DIAGNOSTICS
-# ============================================================
-
-def plot_timing_diagnostics(data, axis_values, tag_id):
-    """Processing time and capture time diagnostics."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
-    fig.suptitle(f'Timing Diagnostics\nTag: {tag_id}',
-                 fontsize=16, fontweight='bold')
-
-    # Top: Histogram of processing_time_ms for readable entries
-    readable_proc = data['processing_time'][data['is_readable']]
-    readable_proc = readable_proc[readable_proc > 0]
-
-    if len(readable_proc) > 0:
-        ax1.hist(readable_proc, bins=30, color='#1976d2', alpha=0.7, edgecolor='black')
-        ax1.axvline(np.mean(readable_proc), color='red', linewidth=2,
-                    linestyle='--', label=f'Mean: {np.mean(readable_proc):.1f}ms')
-        ax1.axvline(np.median(readable_proc), color='orange', linewidth=2,
-                    linestyle='--', label=f'Median: {np.median(readable_proc):.1f}ms')
-        ax1.legend(fontsize=10)
-
-    ax1.set_xlabel('Processing Time (ms)', fontsize=11)
-    ax1.set_ylabel('Count', fontsize=11)
-    ax1.set_title('Server Processing Time (readable entries)', fontsize=12)
-
-    # Bottom: Capture time vs index, colored by height
-    indices = np.arange(len(data['capture_time']))
-    colors_map = {70: '#d32f2f', 90: '#ff9800', 110: '#4caf50', 130: '#1976d2'}
-
-    for h in axis_values['height']:
-        mask = np.isclose(data['heights'], h)
-        ax2.scatter(indices[mask], data['capture_time'][mask],
-                   s=3, color=colors_map.get(h, 'gray'), alpha=0.6, label=f'H={h}mm')
-
-    ax2.set_xlabel('Position Index', fontsize=11)
-    ax2.set_ylabel('Capture Time (s)', fontsize=11)
-    ax2.set_title('Capture Time per Position', fontsize=12)
-    ax2.legend(fontsize=9, markerscale=3)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
-    save_path = OUTPUT_DIR / f'{tag_id}_timing.png'
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    print(f"  Saved: {save_path.name}")
-
-
-# ============================================================
-# PLOT 7: MULTI-DATASET COMPARISON
+# PLOT 5: MULTI-DATASET COMPARISON
 # ============================================================
 
 def plot_comparison(datasets):
-    """Compare multiple datasets side by side."""
+    """Compare speckle across multiple datasets."""
     n = len(datasets)
     tag_ids = [ds['tag_id'] for ds in datasets]
 
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(f'Dataset Comparison: {" vs ".join(tag_ids)}',
+    fig.suptitle(f'Speckle Comparison: {" vs ".join(tag_ids)}',
                  fontsize=16, fontweight='bold')
 
     colors = plt.cm.Set2(np.linspace(0, 1, n))
 
-    # Panel 1: Readability per height (union of all heights across datasets)
+    # Panel 1: Mean speckle per height
     all_heights_set = set()
     for ds in datasets:
-        all_heights_set.update(ds['axis_values']['height'])
+        all_heights_set.update(ds['data']['heights'])
     all_heights = np.array(sorted(all_heights_set))
     x = np.arange(len(all_heights))
     width = 0.8 / n
 
     for k, ds in enumerate(datasets):
-        ds_heights = set(ds['axis_values']['height'])
-        rates = []
+        means = []
         for h in all_heights:
-            if h in ds_heights:
-                rate = compute_readability_rate(ds['data'], 'heights', np.array([h]))
-                rates.append(rate[0])
-            else:
-                rates.append(np.nan)
-        rates = np.array(rates)
-        valid = ~np.isnan(rates)
+            mask = np.isclose(ds['data']['heights'], h)
+            sp = ds['data']['speckle_area'][mask]
+            means.append(np.mean(sp) if len(sp) > 0 else np.nan)
+        means = np.array(means)
+        valid = ~np.isnan(means)
         bar_x = x[valid] + k * width - 0.4 + width / 2
-        ax1.bar(bar_x, rates[valid], width,
+        ax1.bar(bar_x, means[valid], width,
                 color=colors[k], label=ds['tag_id'], edgecolor='black', linewidth=0.5)
 
     ax1.set_xticks(x)
     ax1.set_xticklabels([f'{int(h)}mm' for h in all_heights])
-    ax1.set_ylabel('Readability (%)')
-    ax1.set_title('Readability by Height')
+    ax1.set_ylabel('Mean Speckle Area (%)')
+    ax1.set_title('Mean Speckle by Height')
     ax1.legend()
-    ax1.set_ylim(0, 110)
+    ax1.set_ylim(bottom=0)
 
     # Panel 2: Speckle distribution box plots
     speckle_data = []
     labels = []
     for ds in datasets:
-        sp = ds['data']['speckle_area'][ds['data']['is_readable']]
-        sp = sp[~np.isnan(sp)]
-        speckle_data.append(sp)
+        speckle_data.append(ds['data']['speckle_area'])
         labels.append(ds['tag_id'])
 
     bp = ax2.boxplot(speckle_data, tick_labels=labels, patch_artist=True)
@@ -722,39 +516,24 @@ def print_summary(ds):
     data = ds['data']
     tag_id = ds['tag_id']
     axis_values = ds['axis_values']
-
-    total = len(data['outcomes'])
-    n_readable = np.sum(data['is_readable'])
-    n_unreadable = np.sum(data['outcomes'] == 'unreadable')
-    n_error = np.sum(data['outcomes'] == 'server_error')
+    sp = data['speckle_area']
 
     print(f"\n{'='*60}")
     print(f"  Tag: {tag_id}")
     print(f"{'='*60}")
-    print(f"  Positions: {total}")
-    print(f"  Readable:  {n_readable} ({n_readable/total*100:.1f}%)")
-    print(f"  Unreadable: {n_unreadable} ({n_unreadable/total*100:.1f}%)")
-    print(f"  Errors:    {n_error}")
+    print(f"  Positions: {data['total_positions']} total, {data['speckle_positions']} with speckle")
 
-    # Per-height breakdown
-    print(f"\n  Per Height:")
+    # Per-height speckle
+    print(f"\n  Speckle Area per Height:")
     for h in axis_values['height']:
         mask = np.isclose(data['heights'], h)
-        valid = data['outcomes'][mask] != 'server_error'
-        n_read = np.sum(data['is_readable'][mask])
-        n_total = np.sum(valid)
-        rate = n_read / n_total * 100 if n_total > 0 else 0
-        print(f"    {h}mm: {n_read}/{n_total} ({rate:.0f}%)")
+        h_sp = sp[mask]
+        if len(h_sp) > 0:
+            print(f"    {h}mm: mean={np.mean(h_sp):.4f}%, max={np.max(h_sp):.4f}%, "
+                  f"non-zero={np.sum(h_sp > 0)}/{len(h_sp)}")
 
-    # Speckle stats
-    readable_sp = data['speckle_area'][data['is_readable']]
-    valid_sp = readable_sp[~np.isnan(readable_sp)]
-    if len(valid_sp) > 0:
-        print(f"\n  Speckle Area (readable):")
-        print(f"    Mean:   {np.mean(valid_sp):.4f}%")
-        print(f"    Std:    {np.std(valid_sp):.4f}%")
-        print(f"    Max:    {np.max(valid_sp):.4f}%")
-        print(f"    >0:     {np.sum(valid_sp > 0)}/{len(valid_sp)}")
+    print(f"\n  Overall: mean={np.mean(sp):.4f}%, std={np.std(sp):.4f}%, max={np.max(sp):.4f}%")
+    print(f"  Non-zero: {np.sum(sp > 0)}/{len(sp)}")
 
 
 # ============================================================
@@ -791,13 +570,11 @@ if __name__ == '__main__':
         print_summary(ds)
 
         print(f"\n  Generating plots...")
-        plot_readability_heatmap_grid(data, axis_values, tag_id)
         plot_speckle_heatmap_grid(data, axis_values, tag_id)
         plot_marginal_effects(data, axis_values, tag_id)
         plot_angular_sensitivity(data, axis_values, tag_id)
         plot_summary_statistics(data, axis_values, ds['sweep_config'],
                                 ds['sweep_results'], tag_id)
-        plot_timing_diagnostics(data, axis_values, tag_id)
 
     # Multi-dataset comparison
     if len(datasets) > 1:
