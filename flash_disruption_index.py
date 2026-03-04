@@ -477,47 +477,81 @@ def _binary_auc(y_true, scores):
     return float(u / (n_pos * n_neg))
 
 
-def _bimodality_score(vals, bins=36):
+def _find_bimodal_split(vals, bins=36):
     vals = np.asarray(vals, dtype=float)
     vals = vals[np.isfinite(vals)]
     if len(vals) < bins:
-        return np.nan, np.nan, np.nan
+        return None
 
     vmin, vmax = np.percentile(vals, [1, 99])
     if vmax <= vmin:
-        return np.nan, np.nan, np.nan
+        return None
     clipped = np.clip(vals, vmin, vmax)
 
     hist, _ = np.histogram(clipped, bins=bins, range=(vmin, vmax), density=True)
     if np.all(hist <= 0):
-        return np.nan, np.nan, np.nan
+        return None
 
     peak_idx = [i for i in range(1, bins - 1) if hist[i] >= hist[i - 1] and hist[i] >= hist[i + 1]]
     if len(peak_idx) < 2:
-        return 0.0, 0.0, 0.0
+        return {
+            'score': 0.0,
+            'valley_depth': 0.0,
+            'peak_distance': 0.0,
+            'threshold': float(np.median(clipped)),
+            'vmin': float(vmin),
+            'vmax': float(vmax),
+        }
 
-    best = (0.0, 0.0, 0.0)  # valley_depth, peak_dist, objective
+    best = None
     for i in range(len(peak_idx)):
         for j in range(i + 1, len(peak_idx)):
             a = peak_idx[i]
             b = peak_idx[j]
             if b - a < 3:
                 continue
-            valley = np.min(hist[a:b + 1])
+            valley_rel = int(np.argmin(hist[a:b + 1]))
+            valley_idx = a + valley_rel
+            valley = hist[valley_idx]
             peak_h = max(hist[a], hist[b], 1e-8)
             valley_depth = float(np.clip((min(hist[a], hist[b]) - valley) / peak_h, 0, 1))
             peak_dist = float((b - a) / (bins - 1))
             objective = valley_depth * peak_dist
-            if objective > best[2]:
-                best = (valley_depth, peak_dist, objective)
+            if best is None or objective > best['objective']:
+                best = {
+                    'valley_depth': valley_depth,
+                    'peak_distance': peak_dist,
+                    'objective': objective,
+                    'valley_idx': valley_idx,
+                }
 
-    valley_depth, peak_dist, _ = best
+    if best is None:
+        return {
+            'score': 0.0,
+            'valley_depth': 0.0,
+            'peak_distance': 0.0,
+            'threshold': float(np.median(clipped)),
+            'vmin': float(vmin),
+            'vmax': float(vmax),
+        }
+
+    valley_depth = best['valley_depth']
+    peak_dist = best['peak_distance']
     score = float(np.clip(0.6 * valley_depth + 0.4 * peak_dist, 0, 1))
-    return score, valley_depth, peak_dist
+    edges = np.linspace(vmin, vmax, bins + 1)
+    thr = float((edges[best['valley_idx']] + edges[best['valley_idx'] + 1]) / 2.0)
+    return {
+        'score': score,
+        'valley_depth': valley_depth,
+        'peak_distance': peak_dist,
+        'threshold': thr,
+        'vmin': float(vmin),
+        'vmax': float(vmax),
+    }
 
 
 def analyze_experimental_distributions(all_results, output_dir):
-    """Rank experimental metrics by bimodality + speckle separation and plot top candidates."""
+    """Rank experimental metrics by intrinsic bimodality and visualize metric-defined clusters."""
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
 
@@ -525,15 +559,7 @@ def analyze_experimental_distributions(all_results, output_dir):
     if not all_rows:
         return []
 
-    sap = np.array([r['speckle_area_pct'] for r in all_rows], dtype=float)
-    nonzero = sap > 0
-    p75 = np.percentile(sap, 75)
-    high_speckle = sap > p75
-    # Fallback if p75 is degenerate (e.g., many zeros).
-    if np.sum(high_speckle) == 0 or np.sum(~high_speckle) == 0:
-        order = np.argsort(sap)
-        high_speckle = np.zeros(len(sap), dtype=bool)
-        high_speckle[order[int(0.75 * len(sap)):]] = True
+    sap = np.array([r['speckle_area_pct'] for r in all_rows], dtype=float)  # diagnostic only
 
     exp_keys = sorted([
         k for k in all_rows[0].keys()
@@ -548,28 +574,46 @@ def analyze_experimental_distributions(all_results, output_dir):
             continue
 
         x = vals[valid]
-        nz = nonzero[valid]
-        hs = high_speckle[valid]
+        split = _find_bimodal_split(x)
+        if split is None:
+            continue
 
-        bimodal, valley, peak_dist = _bimodality_score(x)
-        auc_nz = _binary_auc(nz, x)
-        auc_hs = _binary_auc(hs, x)
-        auc_nz_skill = np.nan if np.isnan(auc_nz) else abs(auc_nz - 0.5) * 2.0
-        auc_hs_skill = np.nan if np.isnan(auc_hs) else abs(auc_hs - 0.5) * 2.0
+        thr = split['threshold']
+        low = x <= thr
+        high = x > thr
+        if np.sum(low) == 0 or np.sum(high) == 0:
+            continue
 
-        parts = [bimodal if not np.isnan(bimodal) else 0.0]
-        parts.append(auc_nz_skill if not np.isnan(auc_nz_skill) else 0.0)
-        parts.append(auc_hs_skill if not np.isnan(auc_hs_skill) else 0.0)
-        combined = float(np.clip(0.55 * parts[0] + 0.25 * parts[1] + 0.20 * parts[2], 0, 1))
+        n_low = int(np.sum(low))
+        n_high = int(np.sum(high))
+        n_tot = n_low + n_high
+        balance = float(min(n_low, n_high) / max(n_low, n_high))
+        min_frac = float(min(n_low, n_high) / max(n_tot, 1))
+        sep = float(
+            np.clip(
+                abs(np.mean(x[high]) - np.mean(x[low])) / (np.std(x) + 1e-8),
+                0, 3
+            ) / 3.0
+        )
+        balance_gate = float(np.clip(min_frac / 0.20, 0, 1))  # full score only if minority >=20%
+        combined_raw = 0.50 * split['score'] + 0.30 * sep + 0.20 * balance
+        combined = float(np.clip(combined_raw * (0.35 + 0.65 * balance_gate), 0, 1))
+
+        # Diagnostic only: does the metric split align with known speckle values?
+        diag_sap = sap[valid]
+        auc_diag = _binary_auc(diag_sap > 0, x)
 
         ranking.append({
             'metric': key,
             'combined_score': combined,
-            'bimodality_score': float(0 if np.isnan(bimodal) else bimodal),
-            'valley_depth': float(0 if np.isnan(valley) else valley),
-            'peak_distance': float(0 if np.isnan(peak_dist) else peak_dist),
-            'auc_nonzero': float(np.nan if np.isnan(auc_nz) else auc_nz),
-            'auc_high_speckle': float(np.nan if np.isnan(auc_hs) else auc_hs),
+            'bimodality_score': split['score'],
+            'valley_depth': split['valley_depth'],
+            'peak_distance': split['peak_distance'],
+            'threshold': thr,
+            'cluster_balance': balance,
+            'min_cluster_fraction': min_frac,
+            'cluster_separation': sep,
+            'diagnostic_auc_nonzero': float(np.nan if np.isnan(auc_diag) else auc_diag),
             'n': int(np.sum(valid)),
         })
 
@@ -582,18 +626,20 @@ def analyze_experimental_distributions(all_results, output_dir):
     with open(csv_path, 'w') as f:
         header = [
             'metric', 'combined_score', 'bimodality_score', 'valley_depth',
-            'peak_distance', 'auc_nonzero', 'auc_high_speckle', 'n'
+            'peak_distance', 'threshold', 'cluster_balance', 'min_cluster_fraction', 'cluster_separation',
+            'diagnostic_auc_nonzero', 'n'
         ]
         f.write(','.join(header) + '\n')
         for r in ranking:
             f.write(
                 f"{r['metric']},{r['combined_score']:.6f},{r['bimodality_score']:.6f},"
                 f"{r['valley_depth']:.6f},{r['peak_distance']:.6f},"
-                f"{r['auc_nonzero']:.6f},{r['auc_high_speckle']:.6f},{r['n']}\n"
+                f"{r['threshold']:.6f},{r['cluster_balance']:.6f},{r['min_cluster_fraction']:.6f},{r['cluster_separation']:.6f},"
+                f"{r['diagnostic_auc_nonzero']:.6f},{r['n']}\n"
             )
     print(f"  Saved: {csv_path.name}")
 
-    # Plot top metrics as pooled histograms split by low/high speckle.
+    # Plot top metrics as pooled histograms split by metric-defined low/high clusters.
     top = ranking[:8]
     n_top = len(top)
     rows = 2
@@ -605,16 +651,17 @@ def analyze_experimental_distributions(all_results, output_dir):
         ax = axes.flat[i]
         key = item['metric']
         vals = np.array([r.get(key, np.nan) for r in all_rows], dtype=float)
-        valid = np.isfinite(vals) & np.isfinite(sap)
+        valid = np.isfinite(vals)
         x = vals[valid]
-        hs = high_speckle[valid]
+        high = x > item['threshold']
         if np.sum(valid) > 0:
-            if np.sum(~hs) > 0:
-                ax.hist(x[~hs], bins=30, alpha=0.55, color='#1976D2', density=True, label='Low speckle')
-            if np.sum(hs) > 0:
-                ax.hist(x[hs], bins=30, alpha=0.50, color='#d32f2f', density=True, label='High speckle')
+            if np.sum(~high) > 0:
+                ax.hist(x[~high], bins=30, alpha=0.55, color='#1976D2', density=True, label='Low cluster')
+            if np.sum(high) > 0:
+                ax.hist(x[high], bins=30, alpha=0.50, color='#d32f2f', density=True, label='High cluster')
+        ax.axvline(item['threshold'], color='black', linestyle='--', linewidth=1)
         ax.set_title(
-            f"{key}\nscore={item['combined_score']:.3f}, bi={item['bimodality_score']:.3f}",
+            f"{key}\nscore={item['combined_score']:.3f}, bi={item['bimodality_score']:.3f}, thr={item['threshold']:.3f}",
             fontsize=9
         )
         ax.grid(True, axis='y', alpha=0.3)
@@ -629,6 +676,68 @@ def analyze_experimental_distributions(all_results, output_dir):
     plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"  Saved: {save_path.name}")
+
+    # Visual validation for top metric candidates (metric-defined low/high).
+    def load_display_image(scan_dir):
+        master = scan_dir / 'server_data' / 'frame_master.yellow.png'
+        if master.exists():
+            return np.array(Image.open(master))[:, :, :3]
+        yellow_imgs = load_yellow_images(scan_dir)
+        if yellow_imgs:
+            return (yellow_imgs[-1][1] * 255).astype(np.uint8)
+        return None
+
+    for item in ranking[:3]:
+        key = item['metric']
+        vals = np.array([r.get(key, np.nan) for r in all_rows], dtype=float)
+        valid_idx = np.where(np.isfinite(vals))[0]
+        if len(valid_idx) < 10:
+            continue
+        metric_rows = [all_rows[i] for i in valid_idx]
+        metric_vals = vals[valid_idx]
+        order = np.argsort(metric_vals)
+        picks_idx = [order[0], order[len(order)//4], order[len(order)//2], order[3*len(order)//4], order[-1]]
+        picks = [metric_rows[i] for i in picks_idx]
+
+        fig, axes = plt.subplots(2, 5, figsize=(22, 8))
+        fig.suptitle(f'Metric Visual Validation: {key} (threshold={item["threshold"]:.3f})',
+                     fontsize=14, fontweight='bold')
+
+        for col, r in enumerate(picks):
+            img = load_display_image(r['scan_dir'])
+            if img is None:
+                continue
+            mval = r.get(key, np.nan)
+            cluster = 'HIGH' if mval > item['threshold'] else 'LOW'
+
+            axes[0, col].imshow(img)
+            axes[0, col].set_title(
+                f"{r['tag_id']}\n{key}={mval:.3f} ({cluster})\nFDI={r['fdi']:.3f}, Speckle={r['speckle_area_pct']:.3f}%",
+                fontsize=8, fontweight='bold'
+            )
+            axes[0, col].set_xticks([])
+            axes[0, col].set_yticks([])
+
+            ax = axes[1, col]
+            yellow_imgs = load_yellow_images(r['scan_dir'])
+            if yellow_imgs:
+                _, hi = yellow_imgs[-1]
+                g = np.maximum(hi[:, :, 1], 1e-4)
+                ratio = (hi[:, :, 2] / g).ravel()
+                ax.hist(ratio, bins=30, color='#1976D2', alpha=0.75, edgecolor='black', linewidth=0.3)
+                ax.axvline(np.median(ratio), color='red', linestyle='--', linewidth=1)
+            ax.set_xlabel('Blue/Green pixel ratio')
+            ax.set_ylabel('Count' if col == 0 else '')
+            ax.grid(True, axis='y', alpha=0.3)
+
+        axes[0, 0].set_ylabel('Image', fontsize=10)
+        axes[1, 0].set_ylabel('Histogram', fontsize=10)
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        save_path = output_dir / f'experimental_visual_{key}.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        print(f"  Saved: {save_path.name}")
+
     return ranking
 
 
@@ -868,8 +977,9 @@ if __name__ == '__main__':
                 print(
                     f"  {i}. {row['metric']}: score={row['combined_score']:.3f}, "
                     f"bimodal={row['bimodality_score']:.3f}, "
-                    f"AUC(nonzero)={row['auc_nonzero']:.3f}, "
-                    f"AUC(high-speckle)={row['auc_high_speckle']:.3f}"
+                    f"balance={row['cluster_balance']:.3f}, min_frac={row['min_cluster_fraction']:.3f}, "
+                    f"sep={row['cluster_separation']:.3f}, "
+                    f"diagnostic AUC(nonzero)={row['diagnostic_auc_nonzero']:.3f}"
                 )
 
     print(f"\nAll figures saved to: {OUTPUT_DIR}")
