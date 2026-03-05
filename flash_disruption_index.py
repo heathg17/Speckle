@@ -245,7 +245,29 @@ def compute_experimental_distributions(img_rgb):
     bg = b / (g + eps)
     br = b / (r + eps)
     rg_over_b = (0.5 * (r + g)) / (b + eps)
+    rg_diff_norm = (r - g) / (r + g + eps)
+    gb_diff_norm = (g - b) / (g + b + eps)
     chrom_b = b / total
+
+    # Log-chromaticity is robust to multiplicative intensity changes.
+    log_bg = np.log((b + eps) / (g + eps))
+    log_rg = np.log((r + eps) / (g + eps))
+
+    # HSV hue proxy for yellow stability.
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+    hue = np.zeros_like(cmax)
+    mask = delta > 1e-6
+    safe_delta = np.where(mask, delta, 1.0)
+    hue_r = ((g - b) / safe_delta) % 6
+    hue_g = ((b - r) / safe_delta) + 2
+    hue_b = ((r - g) / safe_delta) + 4
+    hue = np.where((cmax == r) & mask, hue_r, hue)
+    hue = np.where((cmax == g) & mask, hue_g, hue)
+    hue = np.where((cmax == b) & mask, hue_b, hue)
+    hue = hue / 6.0
+    hue_dist_yellow = np.minimum(np.abs(hue - 1 / 6), 1 - np.abs(hue - 1 / 6))
 
     white_frac = np.mean((lum > 0.75) & (sat < 0.20))
     hot_blue_frac = np.mean(bg > 0.55)
@@ -258,6 +280,13 @@ def compute_experimental_distributions(img_rgb):
         'bg_ratio_p90': float(np.percentile(bg, 90)),
         'br_ratio_mean': float(np.mean(br)),
         'rg_over_b_mean': float(np.mean(rg_over_b)),
+        'rg_diff_norm_mean': float(np.mean(rg_diff_norm)),
+        'gb_diff_norm_mean': float(np.mean(gb_diff_norm)),
+        'log_bg_mean': float(np.mean(log_bg)),
+        'log_bg_std': float(np.std(log_bg)),
+        'log_rg_mean': float(np.mean(log_rg)),
+        'hue_yellow_distance_mean': float(np.mean(hue_dist_yellow)),
+        'hue_yellow_distance_p90': float(np.percentile(hue_dist_yellow, 90)),
         'blue_chromaticity_mean': float(np.mean(chrom_b)),
         'white_fraction': float(white_frac),
         'hot_blue_fraction': float(hot_blue_frac),
@@ -265,6 +294,74 @@ def compute_experimental_distributions(img_rgb):
         'minkowski_l2_yellow': float(l2),
         'minkowski_l3_yellow': float(l3),
     }
+
+
+def get_metric_pixel_distribution(img_rgb, metric_key):
+    """Return a per-pixel distribution and label appropriate for a metric."""
+    eps = 1e-6
+    base = metric_key
+    if base.startswith('exp_delta_'):
+        base = base[len('exp_delta_'):]
+    elif base.startswith('exp_'):
+        base = base[len('exp_'):]
+
+    r = img_rgb[:, :, 0]
+    g = img_rgb[:, :, 1]
+    b = img_rgb[:, :, 2]
+    total = r + g + b + eps
+    lum = (r + g + b) / 3.0
+
+    if 'lum' in base:
+        return lum.ravel(), 'Luminosity (pixel)'
+    if 'bg_ratio' in base or 'hot_blue' in base:
+        return (b / (g + eps)).ravel(), 'Blue/Green pixel ratio'
+    if 'br_ratio' in base:
+        return (b / (r + eps)).ravel(), 'Blue/Red pixel ratio'
+    if 'rg_over_b' in base:
+        return ((0.5 * (r + g)) / (b + eps)).ravel(), '(R+G)/2B pixel ratio'
+    if 'blue_chromaticity' in base:
+        return (b / total).ravel(), 'Blue chromaticity'
+    if 'log_bg' in base:
+        return np.log((b + eps) / (g + eps)).ravel(), 'log(B/G)'
+    if 'log_rg' in base:
+        return np.log((r + eps) / (g + eps)).ravel(), 'log(R/G)'
+    if 'rg_diff_norm' in base:
+        return ((r - g) / (r + g + eps)).ravel(), '(R-G)/(R+G)'
+    if 'gb_diff_norm' in base:
+        return ((g - b) / (g + b + eps)).ravel(), '(G-B)/(G+B)'
+    if 'hue_yellow_distance' in base:
+        cmax = np.maximum(np.maximum(r, g), b)
+        cmin = np.minimum(np.minimum(r, g), b)
+        delta = cmax - cmin
+        hue = np.zeros_like(cmax)
+        mask = delta > 1e-6
+        safe_delta = np.where(mask, delta, 1.0)
+        hue_r = ((g - b) / safe_delta) % 6
+        hue_g = ((b - r) / safe_delta) + 2
+        hue_b = ((r - g) / safe_delta) + 4
+        hue = np.where((cmax == r) & mask, hue_r, hue)
+        hue = np.where((cmax == g) & mask, hue_g, hue)
+        hue = np.where((cmax == b) & mask, hue_b, hue)
+        hue = hue / 6.0
+        hue_dist_yellow = np.minimum(np.abs(hue - 1 / 6), 1 - np.abs(hue - 1 / 6))
+        return hue_dist_yellow.ravel(), 'Hue distance to yellow'
+    if 'minkowski' in base:
+        dy_r = 1.0 - r
+        dy_g = 1.0 - g
+        dy_b = b
+        if 'l1' in base:
+            d = np.abs(dy_r) + np.abs(dy_g) + np.abs(dy_b)
+            return d.ravel(), 'Minkowski L1 to yellow'
+        if 'l3' in base:
+            d = (np.abs(dy_r)**3 + np.abs(dy_g)**3 + np.abs(dy_b)**3) ** (1.0 / 3.0)
+            return d.ravel(), 'Minkowski L3 to yellow'
+        d = np.sqrt(dy_r**2 + dy_g**2 + dy_b**2)
+        return d.ravel(), 'Minkowski L2 to yellow'
+    if 'white_fraction' in base:
+        sat = (np.max(img_rgb, axis=2) - np.min(img_rgb, axis=2)) / np.maximum(np.max(img_rgb, axis=2), eps)
+        return lum.ravel(), 'Luminosity (white-threshold context)'
+
+    return (b / (g + eps)).ravel(), 'Blue/Green pixel ratio'
 
 
 def compute_fdi(scan_dir):
@@ -646,6 +743,7 @@ def analyze_experimental_distributions(all_results, output_dir):
     cols = 4
     fig, axes = plt.subplots(rows, cols, figsize=(20, 9))
     fig.suptitle('Experimental Distribution Sweep: Top Bimodal Candidates', fontsize=15, fontweight='bold')
+    global_hist_max = 0.0
 
     for i, item in enumerate(top):
         ax = axes.flat[i]
@@ -656,9 +754,15 @@ def analyze_experimental_distributions(all_results, output_dir):
         high = x > item['threshold']
         if np.sum(valid) > 0:
             if np.sum(~high) > 0:
-                ax.hist(x[~high], bins=30, alpha=0.55, color='#1976D2', density=True, label='Low cluster')
+                counts, _, _ = ax.hist(x[~high], bins=30, alpha=0.55, color='#1976D2',
+                                       density=False, label='Low cluster')
+                if len(counts) > 0:
+                    global_hist_max = max(global_hist_max, float(np.max(counts)))
             if np.sum(high) > 0:
-                ax.hist(x[high], bins=30, alpha=0.50, color='#d32f2f', density=True, label='High cluster')
+                counts, _, _ = ax.hist(x[high], bins=30, alpha=0.50, color='#d32f2f',
+                                       density=False, label='High cluster')
+                if len(counts) > 0:
+                    global_hist_max = max(global_hist_max, float(np.max(counts)))
         ax.axvline(item['threshold'], color='black', linestyle='--', linewidth=1)
         ax.set_title(
             f"{key}\nscore={item['combined_score']:.3f}, bi={item['bimodality_score']:.3f}, thr={item['threshold']:.3f}",
@@ -670,6 +774,9 @@ def analyze_experimental_distributions(all_results, output_dir):
 
     for j in range(n_top, rows * cols):
         axes.flat[j].axis('off')
+    if global_hist_max > 0:
+        for j in range(n_top):
+            axes.flat[j].set_ylim(0, global_hist_max * 1.08)
 
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     save_path = output_dir / 'experimental_bimodal_distributions.png'
@@ -702,6 +809,7 @@ def analyze_experimental_distributions(all_results, output_dir):
         fig, axes = plt.subplots(2, 5, figsize=(22, 8))
         fig.suptitle(f'Metric Visual Validation: {key} (threshold={item["threshold"]:.3f})',
                      fontsize=14, fontweight='bold')
+        row1_max = 0.0
 
         for col, r in enumerate(picks):
             img = load_display_image(r['scan_dir'])
@@ -722,13 +830,21 @@ def analyze_experimental_distributions(all_results, output_dir):
             yellow_imgs = load_yellow_images(r['scan_dir'])
             if yellow_imgs:
                 _, hi = yellow_imgs[-1]
-                g = np.maximum(hi[:, :, 1], 1e-4)
-                ratio = (hi[:, :, 2] / g).ravel()
-                ax.hist(ratio, bins=30, color='#1976D2', alpha=0.75, edgecolor='black', linewidth=0.3)
-                ax.axvline(np.median(ratio), color='red', linestyle='--', linewidth=1)
-            ax.set_xlabel('Blue/Green pixel ratio')
+                dist, xlabel = get_metric_pixel_distribution(hi, key)
+                counts, _, _ = ax.hist(dist, bins=30, color='#1976D2', alpha=0.75,
+                                       edgecolor='black', linewidth=0.3)
+                if len(counts) > 0:
+                    row1_max = max(row1_max, float(np.max(counts)))
+                ax.axvline(np.median(dist), color='red', linestyle='--', linewidth=1)
+            else:
+                xlabel = 'Metric pixel distribution'
+            ax.set_xlabel(xlabel)
             ax.set_ylabel('Count' if col == 0 else '')
             ax.grid(True, axis='y', alpha=0.3)
+
+        if row1_max > 0:
+            for col in range(5):
+                axes[1, col].set_ylim(0, row1_max * 1.08)
 
         axes[0, 0].set_ylabel('Image', fontsize=10)
         axes[1, 0].set_ylabel('Histogram', fontsize=10)
@@ -835,6 +951,7 @@ def plot_fdi_focus(all_results, output_dir, calibration_info):
             return
         fig, axes = plt.subplots(2, 5, figsize=(22, 8))
         fig.suptitle(title, fontsize=14, fontweight='bold')
+        row1_max = 0.0
 
         for col, r in enumerate(picks):
             scan_dir = r['scan_dir']
@@ -859,13 +976,20 @@ def plot_fdi_focus(all_results, output_dir, calibration_info):
                 _, hi = yellow_imgs[-1]
                 g = np.maximum(hi[:, :, 1], 1e-4)
                 ratio = (hi[:, :, 2] / g).ravel()
-                ax.hist(ratio, bins=30, color='#1976D2', alpha=0.75, edgecolor='black', linewidth=0.3)
+                counts, _, _ = ax.hist(ratio, bins=30, color='#1976D2', alpha=0.75,
+                                       edgecolor='black', linewidth=0.3)
+                if len(counts) > 0:
+                    row1_max = max(row1_max, float(np.max(counts)))
                 ax.axvline(np.median(ratio), color='red', linestyle='--', linewidth=1)
             ax.set_xlabel('Blue/Green pixel ratio')
             ax.set_ylabel('Count' if col == 0 else '')
             ax.set_title(f"Flash span={r.get('flash_span', 0):.2f}\nSens={r.get('flash_sensitivity', 0):.3f}",
                          fontsize=9)
             ax.grid(True, axis='y', alpha=0.3)
+
+        if row1_max > 0:
+            for col in range(5):
+                axes[1, col].set_ylim(0, row1_max * 1.08)
 
         axes[0, 0].set_ylabel('Image', fontsize=10)
         axes[1, 0].set_ylabel('Histogram', fontsize=10)
